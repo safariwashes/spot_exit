@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: spot-exit-service
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    healthCheckPath: /healthz
