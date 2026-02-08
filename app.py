@@ -9,7 +9,6 @@ from flask import Flask, request
 app = Flask(__name__)
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
 
@@ -31,34 +30,32 @@ def healthz():
 # -------------------------------------------------
 @app.route("/spot/exit", methods=["POST"])
 def spot_exit():
-    # ---- Spot AI signature presence check ----
-    spot_sig = request.headers.get("Spot-Webhook-Signature")
-    spot_meta = request.headers.get("Spot-Webhook-Meta")
-
-    if not spot_sig or not spot_meta:
+    # ---- Spot AI auth (signature presence) ----
+    if not request.headers.get("Spot-Webhook-Signature") or not request.headers.get("Spot-Webhook-Meta"):
         return {"error": "unauthorized"}, 401
 
     payload = request.get_json(silent=True) or {}
-    camera_id = (
-    payload.get("camera_id")
-    or payload.get("cameraId")
-    or (payload.get("camera") or {}).get("id")
-    or (payload.get("camera") or {}).get("camera_id"))
-    event_ts = payload.get("timestamp")  # optional
-  
-    print("===== SPOT PAYLOAD =====")
-    print(payload)
-    print("========================")
 
-    if not camera_id:
+    # ---- Extract camera_id from REAL Spot payload ----
+    camera_id = (
+        payload.get("camera_id")
+        or payload.get("cameraId")
+        or payload.get("data", {}).get("camera", {}).get("id")
+    )
+
+    if camera_id is None:
         return {"error": "camera_id missing"}, 400
+
+    camera_id = str(camera_id)  # normalize to text
+
+    event_ts = payload.get("timestamp")
 
     conn = get_conn()
     try:
         with conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
 
-                # ---- Resolve camera → tenant / location / role ----
+                # ---- Lookup camera mapping ----
                 cur.execute(
                     """
                     SELECT tenant_id, location_id, camera_role
@@ -66,18 +63,11 @@ def spot_exit():
                     WHERE camera_id = %s
                       AND active = true
                     """,
-                    (camera_id,)
+                    (camera_id,),
                 )
                 cam = cur.fetchone()
 
-                if not cam or cam["camera_role"] != "exit":
-                    return {"error": "invalid camera"}, 400
-
-                tenant_id = cam["tenant_id"]
-                location_id = cam["location_id"]
-                camera_role = cam["camera_role"]
-
-                # ---- Insert camera activity event ----
+                # ---- ALWAYS log event first ----
                 cur.execute(
                     """
                     INSERT INTO spot_camera_event (
@@ -94,15 +84,33 @@ def spot_exit():
                     """,
                     (
                         camera_id,
-                        tenant_id,
-                        location_id,
-                        camera_role,
+                        cam["tenant_id"] if cam else None,
+                        cam["location_id"] if cam else None,
+                        cam["camera_role"] if cam else None,
                         event_ts,
                         Json(payload),
                     ),
                 )
 
                 event_id = cur.fetchone()["id"]
+
+                # ---- Validate camera ----
+                if not cam:
+                    cur.execute(
+                        "UPDATE spot_camera_event SET status = 'unknown_camera' WHERE id = %s",
+                        (event_id,),
+                    )
+                    return {"status": "ignored"}, 200
+
+                if cam["camera_role"] != "exit":
+                    cur.execute(
+                        "UPDATE spot_camera_event SET status = 'invalid_role' WHERE id = %s",
+                        (event_id,),
+                    )
+                    return {"status": "ignored"}, 200
+
+                tenant_id = cam["tenant_id"]
+                location_id = cam["location_id"]
 
                 # ---- FIFO tunnel exit update ----
                 cur.execute(
@@ -131,7 +139,7 @@ def spot_exit():
 
                 row = cur.fetchone()
 
-                # ---- Update event result ----
+                # ---- Finalize event ----
                 if row:
                     cur.execute(
                         """
