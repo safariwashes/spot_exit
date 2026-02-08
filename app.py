@@ -20,6 +20,11 @@ def healthz():
 
 @app.route("/spot/exit", methods=["POST"])
 def spot_exit():
+    # TEMP DEBUG — REMOVE AFTER CONFIRMATION
+    print("===== SPOT WEBHOOK HEADERS =====")
+    for k, v in request.headers.items():
+        print(f"{k}: {v}")
+    print("================================")
     # ---- Auth ----
     if request.headers.get("Authorization") != f"Bearer {SPOT_SHARED_SECRET}":
         return {"error": "unauthorized"}, 401
