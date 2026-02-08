@@ -31,8 +31,8 @@ def healthz():
 # -------------------------------------------------
 @app.route("/spot/exit", methods=["POST"])
 def spot_exit():
-    # ---- Spot AI webhook auth (Option 1) ----
-    spot_sig  = request.headers.get("Spot-Webhook-Signature")
+    # ---- Spot AI signature presence check ----
+    spot_sig = request.headers.get("Spot-Webhook-Signature")
     spot_meta = request.headers.get("Spot-Webhook-Meta")
 
     if not spot_sig or not spot_meta:
@@ -40,7 +40,7 @@ def spot_exit():
 
     payload = request.get_json(silent=True) or {}
     camera_id = payload.get("camera_id")
-    event_ts  = payload.get("timestamp")  # optional
+    event_ts = payload.get("timestamp")  # optional
 
     if not camera_id:
         return {"error": "camera_id missing"}, 400
@@ -51,23 +51,27 @@ def spot_exit():
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
 
                 # ---- Resolve camera → tenant / location / role ----
-                cur.execute("""
+                cur.execute(
+                    """
                     SELECT tenant_id, location_id, camera_role
                     FROM spot_camera_map
                     WHERE camera_id = %s
                       AND active = true
-                """, (camera_id,))
+                    """,
+                    (camera_id,)
+                )
                 cam = cur.fetchone()
 
                 if not cam or cam["camera_role"] != "exit":
                     return {"error": "invalid camera"}, 400
 
-                tenant_id   = cam["tenant_id"]
+                tenant_id = cam["tenant_id"]
                 location_id = cam["location_id"]
                 camera_role = cam["camera_role"]
 
                 # ---- Insert camera activity event ----
-                cur.execute("""
+                cur.execute(
+                    """
                     INSERT INTO spot_camera_event (
                         camera_id,
                         tenant_id,
@@ -77,25 +81,28 @@ def spot_exit():
                         raw_payload,
                         status
                     )
-                    VALUES (%s,%s,%s,%s,%s,%s,'received')
-                    RETURNING id;
-                """, (
-                    camera_id,
-                    tenant_id,
-                    location_id,
-                    camera_role,
-                    event_ts,
-                    Json(payload)
-                ))
+                    VALUES (%s, %s, %s, %s, %s, %s, 'received')
+                    RETURNING id
+                    """,
+                    (
+                        camera_id,
+                        tenant_id,
+                        location_id,
+                        camera_role,
+                        event_ts,
+                        Json(payload),
+                    ),
+                )
 
                 event_id = cur.fetchone()["id"]
 
                 # ---- FIFO tunnel exit update ----
-                cur.execute("""
+                cur.execute(
+                    """
                     WITH fifo AS (
                         SELECT bill, location, created_on
                         FROM tunnel
-                        WHERE tenant_id   = %s
+                        WHERE tenant_id = %s
                           AND location_id = %s
                           AND load = true
                           AND exit = false
@@ -104,4 +111,46 @@ def spot_exit():
                         FOR UPDATE SKIP LOCKED
                     )
                     UPDATE tunnel
-                    SET ex
+                    SET exit = true,
+                        exit_time = CURRENT_TIME
+                    WHERE (bill, location, created_on) IN (
+                        SELECT bill, location, created_on FROM fifo
+                    )
+                    RETURNING bill
+                    """,
+                    (tenant_id, location_id),
+                )
+
+                row = cur.fetchone()
+
+                # ---- Update event result ----
+                if row:
+                    cur.execute(
+                        """
+                        UPDATE spot_camera_event
+                        SET matched_bill = %s,
+                            status = 'matched'
+                        WHERE id = %s
+                        """,
+                        (row["bill"], event_id),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        UPDATE spot_camera_event
+                        SET status = 'no_fifo'
+                        WHERE id = %s
+                        """,
+                        (event_id,),
+                    )
+
+        return {"status": "ok"}, 200
+
+    finally:
+        conn.close()
+
+# -------------------------------------------------
+# Local dev
+# -------------------------------------------------
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
