@@ -39,8 +39,16 @@ def spot_exit():
         return {"error": "unauthorized"}, 401
 
     payload = request.get_json(silent=True) or {}
-    camera_id = payload.get("camera_id")
+    camera_id = (
+    payload.get("camera_id")
+    or payload.get("cameraId")
+    or (payload.get("camera") or {}).get("id")
+    or (payload.get("camera") or {}).get("camera_id"))
     event_ts = payload.get("timestamp")  # optional
+  
+    print("===== SPOT PAYLOAD =====")
+    print(payload)
+    print("========================")
 
     if not camera_id:
         return {"error": "camera_id missing"}, 400
