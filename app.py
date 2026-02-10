@@ -26,17 +26,18 @@ def healthz():
     return {"status": "ok"}, 200
 
 # -------------------------------------------------
-# Spot AI Exit Webhook
+# Spot AI Exit / Entry Webhook
 # -------------------------------------------------
 @app.route("/spot/exit", methods=["POST"])
 def spot_exit():
-    # ---- Spot AI auth (signature presence) ----
+
+    # ---- Spot webhook auth (presence check only) ----
     if not request.headers.get("Spot-Webhook-Signature") or not request.headers.get("Spot-Webhook-Meta"):
         return {"error": "unauthorized"}, 401
 
     payload = request.get_json(silent=True) or {}
 
-    # ---- Extract camera_id from REAL Spot payload ----
+    # ---- Extract camera_id from real Spot payload shapes ----
     camera_id = (
         payload.get("camera_id")
         or payload.get("cameraId")
@@ -46,8 +47,7 @@ def spot_exit():
     if camera_id is None:
         return {"error": "camera_id missing"}, 400
 
-    camera_id = str(camera_id)  # normalize to text
-
+    camera_id = str(camera_id)
     event_ts = payload.get("timestamp")
 
     conn = get_conn()
@@ -55,7 +55,9 @@ def spot_exit():
         with conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
 
-                # ---- Lookup camera mapping ----
+                # -------------------------------------------------
+                # Camera resolution
+                # -------------------------------------------------
                 cur.execute(
                     """
                     SELECT tenant_id, location_id, camera_role
@@ -67,7 +69,13 @@ def spot_exit():
                 )
                 cam = cur.fetchone()
 
-                # ---- ALWAYS log event first ----
+                tenant_id = cam["tenant_id"] if cam else None
+                location_id = cam["location_id"] if cam else None
+                camera_role = cam["camera_role"] if cam else None
+
+                # -------------------------------------------------
+                # ALWAYS insert audit row FIRST (non-negotiable)
+                # -------------------------------------------------
                 cur.execute(
                     """
                     INSERT INTO spot_camera_event (
@@ -84,9 +92,9 @@ def spot_exit():
                     """,
                     (
                         camera_id,
-                        cam["tenant_id"] if cam else None,
-                        cam["location_id"] if cam else None,
-                        cam["camera_role"] if cam else None,
+                        tenant_id,
+                        location_id,
+                        camera_role,
                         event_ts,
                         Json(payload),
                     ),
@@ -94,25 +102,34 @@ def spot_exit():
 
                 event_id = cur.fetchone()["id"]
 
-                # ---- Validate camera ----
+                # -------------------------------------------------
+                # Camera validation
+                # -------------------------------------------------
                 if not cam:
                     cur.execute(
-                        "UPDATE spot_camera_event SET status = 'unknown_camera' WHERE id = %s",
+                        """
+                        UPDATE spot_camera_event
+                        SET status = 'unknown_camera'
+                        WHERE id = %s
+                        """,
                         (event_id,),
                     )
                     return {"status": "ignored"}, 200
 
-                if cam["camera_role"] != "exit":
+                if camera_role != "exit":
                     cur.execute(
-                        "UPDATE spot_camera_event SET status = 'invalid_role' WHERE id = %s",
+                        """
+                        UPDATE spot_camera_event
+                        SET status = 'invalid_role'
+                        WHERE id = %s
+                        """,
                         (event_id,),
                     )
                     return {"status": "ignored"}, 200
 
-                tenant_id = cam["tenant_id"]
-                location_id = cam["location_id"]
-
-                # ---- FIFO tunnel exit update ----
+                # -------------------------------------------------
+                # FIFO tunnel exit attempt (best-effort)
+                # -------------------------------------------------
                 cur.execute(
                     """
                     WITH fifo AS (
@@ -139,7 +156,9 @@ def spot_exit():
 
                 row = cur.fetchone()
 
-                # ---- Finalize event ----
+                # -------------------------------------------------
+                # Diagnose failure vs success
+                # -------------------------------------------------
                 if row:
                     cur.execute(
                         """
@@ -151,13 +170,36 @@ def spot_exit():
                         (row["bill"], event_id),
                     )
                 else:
+                    # Diagnose WHY nothing matched
+                    cur.execute(
+                        """
+                        SELECT load, exit
+                        FROM tunnel
+                        WHERE tenant_id = %s
+                          AND location_id = %s
+                        ORDER BY load_time ASC
+                        LIMIT 1
+                        """,
+                        (tenant_id, location_id),
+                    )
+                    state = cur.fetchone()
+
+                    if not state:
+                        status = "no_tunnel_rows"
+                    elif not state["load"]:
+                        status = "load_not_ready"
+                    elif state["exit"]:
+                        status = "exit_already_true"
+                    else:
+                        status = "no_fifo"
+
                     cur.execute(
                         """
                         UPDATE spot_camera_event
-                        SET status = 'no_fifo'
+                        SET status = %s
                         WHERE id = %s
                         """,
-                        (event_id,),
+                        (status, event_id),
                     )
 
         return {"status": "ok"}, 200
