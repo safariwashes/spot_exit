@@ -9,8 +9,8 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
 
-# Sentinel UUIDs (MUST exist in tenants & locations tables)
-UNKNOWN_TENANT_ID   = "00000000-0000-0000-0000-000000000000"
+# Sentinel values (must exist in DB)
+UNKNOWN_TENANT_ID = "00000000-0000-0000-0000-000000000000"
 UNKNOWN_LOCATION_ID = "00000000-0000-0000-0000-000000000000"
 UNKNOWN_ROLE = "unknown"
 
@@ -38,9 +38,7 @@ def spot_exit():
     with conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
 
-            # -------------------------------------------------
-            # Resolve camera mapping FIRST (but NEVER return)
-            # -------------------------------------------------
+            # Resolve camera mapping (never returns)
             cur.execute(
                 """
                 SELECT tenant_id, location_id, camera_role
@@ -56,9 +54,7 @@ def spot_exit():
             location_id = cam["location_id"] if cam else UNKNOWN_LOCATION_ID
             camera_role = cam["camera_role"] if cam else UNKNOWN_ROLE
 
-            # -------------------------------------------------
-            # ALWAYS INSERT (satisfies NOT NULL constraints)
-            # -------------------------------------------------
+            # ALWAYS INSERT — must satisfy NOT NULL + CHECK
             cur.execute(
                 """
                 INSERT INTO spot_camera_event (
@@ -88,9 +84,7 @@ def spot_exit():
 
             event_id = cur.fetchone()["id"]
 
-            # -------------------------------------------------
-            # Auth classification (NEVER drops row)
-            # -------------------------------------------------
+            # Classify — NEVER introduce new statuses
             if not request.headers.get("Spot-Webhook-Signature") or not request.headers.get("Spot-Webhook-Meta"):
                 cur.execute(
                     """
@@ -102,9 +96,6 @@ def spot_exit():
                 )
                 return {"status": "logged"}, 200
 
-            # -------------------------------------------------
-            # Camera validation classification
-            # -------------------------------------------------
             if not cam:
                 cur.execute(
                     """
@@ -127,17 +118,8 @@ def spot_exit():
                 )
                 return {"status": "logged"}, 200
 
-            # -------------------------------------------------
-            # Exit role acknowledged (business logic later)
-            # -------------------------------------------------
-            cur.execute(
-                """
-                UPDATE spot_camera_event
-                SET status = 'exit_received'
-                WHERE id = %s
-                """,
-                (event_id,),
-            )
+            # EXIT role accepted — leave status as 'received'
+            # Tunnel logic will update it later
 
     return {"status": "ok"}, 200
 
