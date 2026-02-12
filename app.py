@@ -9,6 +9,11 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
 
+# Sentinel UUIDs (MUST exist in tenants & locations tables)
+UNKNOWN_TENANT_ID   = "00000000-0000-0000-0000-000000000000"
+UNKNOWN_LOCATION_ID = "00000000-0000-0000-0000-000000000000"
+UNKNOWN_ROLE = "unknown"
+
 def get_conn():
     return psycopg2.connect(DATABASE_URL)
 
@@ -33,20 +38,46 @@ def spot_exit():
     with conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
 
-            # ALWAYS log first — no conditions, no auth, no validation
+            # -------------------------------------------------
+            # Resolve camera mapping FIRST (but NEVER return)
+            # -------------------------------------------------
+            cur.execute(
+                """
+                SELECT tenant_id, location_id, camera_role
+                FROM spot_camera_map
+                WHERE camera_id = %s
+                  AND active = true
+                """,
+                (camera_id,),
+            )
+            cam = cur.fetchone()
+
+            tenant_id = cam["tenant_id"] if cam else UNKNOWN_TENANT_ID
+            location_id = cam["location_id"] if cam else UNKNOWN_LOCATION_ID
+            camera_role = cam["camera_role"] if cam else UNKNOWN_ROLE
+
+            # -------------------------------------------------
+            # ALWAYS INSERT (satisfies NOT NULL constraints)
+            # -------------------------------------------------
             cur.execute(
                 """
                 INSERT INTO spot_camera_event (
                     camera_id,
+                    tenant_id,
+                    location_id,
+                    camera_role,
                     event_ts,
                     raw_payload,
                     status
                 )
-                VALUES (%s, %s, %s, 'received')
+                VALUES (%s, %s, %s, %s, %s, %s, 'received')
                 RETURNING id
                 """,
                 (
                     camera_id,
+                    tenant_id,
+                    location_id,
+                    camera_role,
                     event_ts,
                     Json({
                         "headers": dict(request.headers),
@@ -57,7 +88,9 @@ def spot_exit():
 
             event_id = cur.fetchone()["id"]
 
-            # Optional auth classification (does NOT drop rows)
+            # -------------------------------------------------
+            # Auth classification (NEVER drops row)
+            # -------------------------------------------------
             if not request.headers.get("Spot-Webhook-Signature") or not request.headers.get("Spot-Webhook-Meta"):
                 cur.execute(
                     """
@@ -68,6 +101,43 @@ def spot_exit():
                     (event_id,),
                 )
                 return {"status": "logged"}, 200
+
+            # -------------------------------------------------
+            # Camera validation classification
+            # -------------------------------------------------
+            if not cam:
+                cur.execute(
+                    """
+                    UPDATE spot_camera_event
+                    SET status = 'unknown_camera'
+                    WHERE id = %s
+                    """,
+                    (event_id,),
+                )
+                return {"status": "logged"}, 200
+
+            if camera_role != "exit":
+                cur.execute(
+                    """
+                    UPDATE spot_camera_event
+                    SET status = 'invalid_role'
+                    WHERE id = %s
+                    """,
+                    (event_id,),
+                )
+                return {"status": "logged"}, 200
+
+            # -------------------------------------------------
+            # Exit role acknowledged (business logic later)
+            # -------------------------------------------------
+            cur.execute(
+                """
+                UPDATE spot_camera_event
+                SET status = 'exit_received'
+                WHERE id = %s
+                """,
+                (event_id,),
+            )
 
     return {"status": "ok"}, 200
 
