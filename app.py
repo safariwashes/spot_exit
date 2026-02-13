@@ -31,7 +31,7 @@ def spot_exit():
         or payload.get("cameraId")
         or payload.get("data", {}).get("camera", {}).get("id")
     )
-    camera_id = str(camera_id) if camera_id is not None else None
+    camera_id = str(camera_id) if camera_id is not None else "UNKNOWN"
     event_ts = payload.get("timestamp")
 
     conn = get_conn()
