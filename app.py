@@ -52,7 +52,7 @@ def spot_exit():
 
             tenant_id = cam["tenant_id"] if cam else UNKNOWN_TENANT_ID
             location_id = cam["location_id"] if cam else UNKNOWN_LOCATION_ID
-            camera_role = cam["camera_role"] if cam else UNKNOWN_ROLE
+            camera_role = cam["camera_role"] if cam else "exit"
 
             # ALWAYS INSERT — must satisfy NOT NULL + CHECK
             cur.execute(
