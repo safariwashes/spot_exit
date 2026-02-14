@@ -9,10 +9,8 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
 
-# Sentinel values (must exist in DB)
 UNKNOWN_TENANT_ID = "00000000-0000-0000-0000-000000000000"
 UNKNOWN_LOCATION_ID = "00000000-0000-0000-0000-000000000000"
-UNKNOWN_ROLE = "unknown"
 
 def get_conn():
     return psycopg2.connect(DATABASE_URL)
@@ -31,95 +29,84 @@ def spot_exit():
         or payload.get("cameraId")
         or payload.get("data", {}).get("camera", {}).get("id")
     )
-    camera_id = str(camera_id) if camera_id is not None else "UNKNOWN"
+    camera_id = str(camera_id) if camera_id else "UNKNOWN"
     event_ts = payload.get("timestamp")
 
+    final_status = "received"
+
     conn = get_conn()
-    with conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
 
-            # Resolve camera mapping (never returns)
-            cur.execute(
-                """
-                SELECT tenant_id, location_id, camera_role
-                FROM spot_camera_map
-                WHERE camera_id = %s
-                  AND active = true
-                """,
-                (camera_id,),
-            )
-            cam = cur.fetchone()
-
-            tenant_id = cam["tenant_id"] if cam else UNKNOWN_TENANT_ID
-            location_id = cam["location_id"] if cam else UNKNOWN_LOCATION_ID
-            camera_role = cam["camera_role"] if cam else "exit"
-
-            # ALWAYS INSERT — must satisfy NOT NULL + CHECK
-            cur.execute(
-                """
-                INSERT INTO spot_camera_event (
-                    camera_id,
-                    tenant_id,
-                    location_id,
-                    camera_role,
-                    event_ts,
-                    raw_payload,
-                    status
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, 'received')
-                RETURNING id
-                """,
-                (
-                    camera_id,
-                    tenant_id,
-                    location_id,
-                    camera_role,
-                    event_ts,
-                    Json({
-                        "headers": dict(request.headers),
-                        "payload": payload
-                    }),
-                ),
-            )
-
-            event_id = cur.fetchone()["id"]
-
-            # Classify — NEVER introduce new statuses
-            if not request.headers.get("Spot-Webhook-Signature") or not request.headers.get("Spot-Webhook-Meta"):
+                # Resolve camera mapping (safe)
                 cur.execute(
                     """
-                    UPDATE spot_camera_event
-                    SET status = 'unauthorized'
-                    WHERE id = %s
+                    SELECT tenant_id, location_id, camera_role
+                    FROM spot_camera_map
+                    WHERE camera_id = %s
+                      AND active = true
                     """,
-                    (event_id,),
+                    (camera_id,),
                 )
-                return {"status": "logged"}, 200
+                cam = cur.fetchone()
 
-            if not cam:
+                tenant_id = cam["tenant_id"] if cam else UNKNOWN_TENANT_ID
+                location_id = cam["location_id"] if cam else UNKNOWN_LOCATION_ID
+                camera_role = cam["camera_role"] if cam else "exit"
+
+                # ALWAYS INSERT
                 cur.execute(
                     """
-                    UPDATE spot_camera_event
-                    SET status = 'unknown_camera'
-                    WHERE id = %s
+                    INSERT INTO spot_camera_event (
+                        camera_id,
+                        tenant_id,
+                        location_id,
+                        camera_role,
+                        event_ts,
+                        raw_payload,
+                        status
+                    )
+                    VALUES (%s,%s,%s,%s,%s,%s,%s)
+                    RETURNING id
                     """,
-                    (event_id,),
+                    (
+                        camera_id,
+                        tenant_id,
+                        location_id,
+                        camera_role,
+                        event_ts,
+                        Json({
+                            "headers": dict(request.headers),
+                            "payload": payload
+                        }),
+                        final_status,
+                    ),
                 )
-                return {"status": "logged"}, 200
 
-            if camera_role != "exit":
-                cur.execute(
-                    """
-                    UPDATE spot_camera_event
-                    SET status = 'invalid_role'
-                    WHERE id = %s
-                    """,
-                    (event_id,),
-                )
-                return {"status": "logged"}, 200
+                event_id = cur.fetchone()["id"]
 
-            # EXIT role accepted — leave status as 'received'
-            # Tunnel logic will update it later
+                # Classify AFTER insert
+                if not request.headers.get("Spot-Webhook-Signature") or not request.headers.get("Spot-Webhook-Meta"):
+                    final_status = "unauthorized"
+                elif not cam:
+                    final_status = "unknown_camera"
+                elif camera_role != "exit":
+                    final_status = "invalid_role"
+
+                # Update status once
+                if final_status != "received":
+                    cur.execute(
+                        """
+                        UPDATE spot_camera_event
+                        SET status = %s
+                        WHERE id = %s
+                        """,
+                        (final_status, event_id),
+                    )
+
+    finally:
+        conn.close()
 
     return {"status": "ok"}, 200
 
