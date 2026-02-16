@@ -3,68 +3,107 @@ import json
 import time
 import boto3
 import psycopg2
-from datetime import datetime
+from psycopg2.extras import execute_values
+from flask import Flask, jsonify
 
-sqs = boto3.client(
-    "sqs",
-    region_name="us-east-2",
-    aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
-    aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
-)
+app = Flask(__name__)
 
-QUEUE_URL = os.environ["SPOT_QUEUE_URL"]
+# -----------------------------
+# AWS / SQS
+# -----------------------------
+sqs = boto3.client("sqs")
+QUEUE_URL = os.environ["SPOT_EVENTS_QUEUE_URL"]
 
-def get_db_conn():
-    return psycopg2.connect(
-        host=os.environ["DB_HOST"],
-        dbname=os.environ["DB_NAME"],
-        user=os.environ["DB_USER"],
-        password=os.environ["DB_PASSWORD"],
-        port=5432,
-    )
+# -----------------------------
+# DB CONFIG
+# -----------------------------
+DB_CONFIG = {
+    "host": os.environ["DB_HOST"],
+    "dbname": os.environ["DB_NAME"],
+    "user": os.environ["DB_USER"],
+    "password": os.environ["DB_PASSWORD"],
+    "port": int(os.environ.get("DB_PORT", 5432)),
+}
 
-while True:
-    resp = sqs.receive_message(
-        QueueUrl=QUEUE_URL,
-        MaxNumberOfMessages=5,
-        WaitTimeSeconds=20,
-        VisibilityTimeout=60,
-    )
+# -----------------------------
+# DB Helper (SAFE)
+# -----------------------------
+def get_db_conn(retries=5, delay=2):
+    for attempt in range(retries):
+        try:
+            return psycopg2.connect(**DB_CONFIG)
+        except psycopg2.OperationalError as e:
+            if attempt == retries - 1:
+                raise
+            print(f"DB not ready, retrying in {delay}s...")
+            time.sleep(delay)
 
-    messages = resp.get("Messages", [])
+# -----------------------------
+# Health check
+# -----------------------------
+@app.route("/healthz")
+def healthz():
+    return jsonify({"status": "ok"})
 
-    if not messages:
-        continue
-
-    conn = get_db_conn()
-    conn.autocommit = False
+# -----------------------------
+# SQS Worker Endpoint
+# -----------------------------
+@app.route("/worker/spot", methods=["POST"])
+def process_spot_events():
+    conn = None
 
     try:
+        conn = get_db_conn()
+        conn.autocommit = False
+
         with conn.cursor() as cur:
-            for msg in messages:
-                body = json.loads(msg["Body"])
-                payload = body["payload"]
+            resp = sqs.receive_message(
+                QueueUrl=QUEUE_URL,
+                MaxNumberOfMessages=10,
+                WaitTimeSeconds=2,
+            )
 
-                # Example insert
-                cur.execute(
-                    """
-                    INSERT INTO spot_events_raw (payload, received_at)
-                    VALUES (%s, %s)
-                    """,
-                    (json.dumps(payload), datetime.utcnow())
-                )
+            messages = resp.get("Messages", [])
+            if not messages:
+                return jsonify({"processed": 0})
 
-                # delete ONLY after DB success
-                sqs.delete_message(
-                    QueueUrl=QUEUE_URL,
-                    ReceiptHandle=msg["ReceiptHandle"],
-                )
+            rows = []
+            receipt_handles = []
+
+            for m in messages:
+                body = json.loads(m["Body"])
+                payload = body.get("payload", {})
+                rows.append((
+                    payload.get("event_type"),
+                    json.dumps(payload),
+                ))
+                receipt_handles.append(m["ReceiptHandle"])
+
+            execute_values(
+                cur,
+                """
+                INSERT INTO spot_events (event_type, payload)
+                VALUES %s
+                """,
+                rows,
+            )
 
         conn.commit()
 
+        for rh in receipt_handles:
+            sqs.delete_message(
+                QueueUrl=QUEUE_URL,
+                ReceiptHandle=rh
+            )
+
+        return jsonify({"processed": len(rows)})
+
     except Exception as e:
-        conn.rollback()
+        if conn:
+            conn.rollback()
         print("ERROR:", e)
+        return jsonify({"error": str(e)}), 500
 
     finally:
-        conn.close()
+        if conn:
+            conn.close()
