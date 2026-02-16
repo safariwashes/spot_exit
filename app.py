@@ -1,114 +1,70 @@
 import os
+import json
+import time
+import boto3
 import psycopg2
-from psycopg2.extras import RealDictCursor, Json
-from flask import Flask, request
+from datetime import datetime
 
-app = Flask(__name__)
+sqs = boto3.client(
+    "sqs",
+    region_name="us-east-2",
+    aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+    aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+)
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not set")
+QUEUE_URL = os.environ["SPOT_QUEUE_URL"]
 
-UNKNOWN_TENANT_ID = "00000000-0000-0000-0000-000000000000"
-UNKNOWN_LOCATION_ID = "00000000-0000-0000-0000-000000000000"
-
-def get_conn():
-    return psycopg2.connect(DATABASE_URL)
-
-@app.route("/healthz", methods=["GET"])
-def healthz():
-    return {"status": "ok"}, 200
-
-@app.route("/spot/exit", methods=["POST"])
-def spot_exit():
-
-    payload = request.get_json(silent=True) or {}
-
-    camera_id = (
-        payload.get("camera_id")
-        or payload.get("cameraId")
-        or payload.get("data", {}).get("camera", {}).get("id")
+def get_db_conn():
+    return psycopg2.connect(
+        host=os.environ["DB_HOST"],
+        dbname=os.environ["DB_NAME"],
+        user=os.environ["DB_USER"],
+        password=os.environ["DB_PASSWORD"],
+        port=5432,
     )
-    camera_id = str(camera_id) if camera_id else "UNKNOWN"
-    event_ts = payload.get("timestamp")
 
-    final_status = "received"
+while True:
+    resp = sqs.receive_message(
+        QueueUrl=QUEUE_URL,
+        MaxNumberOfMessages=5,
+        WaitTimeSeconds=20,
+        VisibilityTimeout=60,
+    )
 
-    conn = get_conn()
+    messages = resp.get("Messages", [])
+
+    if not messages:
+        continue
+
+    conn = get_db_conn()
+    conn.autocommit = False
+
     try:
-        with conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        with conn.cursor() as cur:
+            for msg in messages:
+                body = json.loads(msg["Body"])
+                payload = body["payload"]
 
-                # Resolve camera mapping (safe)
+                # Example insert
                 cur.execute(
                     """
-                    SELECT tenant_id, location_id, camera_role
-                    FROM spot_camera_map
-                    WHERE camera_id = %s
-                      AND active = true
+                    INSERT INTO spot_events_raw (payload, received_at)
+                    VALUES (%s, %s)
                     """,
-                    (camera_id,),
-                )
-                cam = cur.fetchone()
-
-                tenant_id = cam["tenant_id"] if cam else UNKNOWN_TENANT_ID
-                location_id = cam["location_id"] if cam else UNKNOWN_LOCATION_ID
-                camera_role = cam["camera_role"] if cam else "exit"
-
-                # ALWAYS INSERT
-                cur.execute(
-                    """
-                    INSERT INTO spot_camera_event (
-                        camera_id,
-                        tenant_id,
-                        location_id,
-                        camera_role,
-                        event_ts,
-                        raw_payload,
-                        status
-                    )
-                    VALUES (%s,%s,%s,%s,%s,%s,%s)
-                    RETURNING id
-                    """,
-                    (
-                        camera_id,
-                        tenant_id,
-                        location_id,
-                        camera_role,
-                        event_ts,
-                        Json({
-                            "headers": dict(request.headers),
-                            "payload": payload
-                        }),
-                        final_status,
-                    ),
+                    (json.dumps(payload), datetime.utcnow())
                 )
 
-                event_id = cur.fetchone()["id"]
+                # delete ONLY after DB success
+                sqs.delete_message(
+                    QueueUrl=QUEUE_URL,
+                    ReceiptHandle=msg["ReceiptHandle"],
+                )
 
-                # Classify AFTER insert
-                if not request.headers.get("Spot-Webhook-Signature") or not request.headers.get("Spot-Webhook-Meta"):
-                    final_status = "unauthorized"
-                elif not cam:
-                    final_status = "unknown_camera"
-                elif camera_role != "exit":
-                    final_status = "invalid_role"
+        conn.commit()
 
-                # Update status once
-                if final_status != "received":
-                    cur.execute(
-                        """
-                        UPDATE spot_camera_event
-                        SET status = %s
-                        WHERE id = %s
-                        """,
-                        (final_status, event_id),
-                    )
+    except Exception as e:
+        conn.rollback()
+        print("ERROR:", e)
 
     finally:
         conn.close()
-
-    return {"status": "ok"}, 200
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
