@@ -3,20 +3,27 @@ import json
 import time
 import boto3
 import psycopg2
-from psycopg2.extras import execute_values
 from flask import Flask, jsonify
 
+# --------------------------------------------------
+# Flask app
+# --------------------------------------------------
 app = Flask(__name__)
 
-# -----------------------------
+# --------------------------------------------------
 # AWS / SQS
-# -----------------------------
-sqs = boto3.client("sqs")
+# --------------------------------------------------
+AWS_REGION = os.environ.get("AWS_REGION", "us-east-2")
 QUEUE_URL = os.environ["SPOT_EVENTS_QUEUE_URL"]
 
-# -----------------------------
-# DB CONFIG
-# -----------------------------
+sqs = boto3.client(
+    "sqs",
+    region_name=AWS_REGION
+)
+
+# --------------------------------------------------
+# Postgres config (Render DB)
+# --------------------------------------------------
 DB_CONFIG = {
     "host": os.environ["DB_HOST"],
     "dbname": os.environ["DB_NAME"],
@@ -25,83 +32,89 @@ DB_CONFIG = {
     "port": int(os.environ.get("DB_PORT", 5432)),
 }
 
-# -----------------------------
-# DB Helper (SAFE)
-# -----------------------------
+# --------------------------------------------------
+# Safe DB connector (retry on startup)
+# --------------------------------------------------
 def get_db_conn(retries=5, delay=2):
-    for attempt in range(retries):
+    for i in range(retries):
         try:
             return psycopg2.connect(**DB_CONFIG)
         except psycopg2.OperationalError as e:
-            if attempt == retries - 1:
+            if i == retries - 1:
                 raise
-            print(f"DB not ready, retrying in {delay}s...")
+            print(f"[DB] Not ready yet, retrying in {delay}s...")
             time.sleep(delay)
 
-# -----------------------------
-# Health check
-# -----------------------------
-@app.route("/healthz")
+# --------------------------------------------------
+# Health check (Render + uptime monitors)
+# --------------------------------------------------
+@app.route("/healthz", methods=["GET"])
 def healthz():
     return jsonify({"status": "ok"})
 
-# -----------------------------
+# --------------------------------------------------
 # SQS Worker Endpoint
-# -----------------------------
+# --------------------------------------------------
 @app.route("/worker/spot", methods=["POST"])
 def process_spot_events():
+    print("[WORKER] Polling SQS...")
+
     conn = None
+    processed = 0
 
     try:
+        # ---- Fetch messages ----
+        resp = sqs.receive_message(
+            QueueUrl=QUEUE_URL,
+            MaxNumberOfMessages=10,
+            WaitTimeSeconds=2,
+        )
+
+        messages = resp.get("Messages", [])
+        if not messages:
+            return jsonify({"processed": 0})
+
+        # ---- DB connection (ONLY here) ----
         conn = get_db_conn()
         conn.autocommit = False
 
         with conn.cursor() as cur:
-            resp = sqs.receive_message(
-                QueueUrl=QUEUE_URL,
-                MaxNumberOfMessages=10,
-                WaitTimeSeconds=2,
-            )
-
-            messages = resp.get("Messages", [])
-            if not messages:
-                return jsonify({"processed": 0})
-
-            rows = []
-            receipt_handles = []
-
-            for m in messages:
-                body = json.loads(m["Body"])
+            for msg in messages:
+                body = json.loads(msg["Body"])
                 payload = body.get("payload", {})
-                rows.append((
-                    payload.get("event_type"),
-                    json.dumps(payload),
-                ))
-                receipt_handles.append(m["ReceiptHandle"])
 
-            execute_values(
-                cur,
-                """
-                INSERT INTO spot_events (event_type, payload)
-                VALUES %s
-                """,
-                rows,
-            )
+                # Minimal insert (expand later safely)
+                cur.execute(
+                    """
+                    INSERT INTO spot_events (
+                        event_type,
+                        payload
+                    )
+                    VALUES (%s, %s)
+                    """,
+                    (
+                        payload.get("event_type"),
+                        json.dumps(payload),
+                    )
+                )
+
+                # Delete message only AFTER successful insert
+                sqs.delete_message(
+                    QueueUrl=QUEUE_URL,
+                    ReceiptHandle=msg["ReceiptHandle"]
+                )
+
+                processed += 1
 
         conn.commit()
+        print(f"[WORKER] Processed {processed} messages")
 
-        for rh in receipt_handles:
-            sqs.delete_message(
-                QueueUrl=QUEUE_URL,
-                ReceiptHandle=rh
-            )
-
-        return jsonify({"processed": len(rows)})
+        return jsonify({"processed": processed})
 
     except Exception as e:
         if conn:
             conn.rollback()
-        print("ERROR:", e)
+        print("[ERROR]", str(e))
         return jsonify({"error": str(e)}), 500
 
     finally:
